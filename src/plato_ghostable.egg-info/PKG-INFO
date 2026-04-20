@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: plato-ghostable
+Version: 0.1.0
+Summary: Ghostable lifecycle — mark tiles/agents for active/ghost/resurrected states
+License: MIT
+Requires-Python: >=3.8

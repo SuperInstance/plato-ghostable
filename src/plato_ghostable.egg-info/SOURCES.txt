@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+src/plato_ghostable/__init__.py
+src/plato_ghostable/ghostable.py
+src/plato_ghostable.egg-info/PKG-INFO
+src/plato_ghostable.egg-info/SOURCES.txt
+src/plato_ghostable.egg-info/dependency_links.txt
+src/plato_ghostable.egg-info/top_level.txt
