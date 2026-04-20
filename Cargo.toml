@@ -1,0 +1,11 @@
+[package]
+name = "plato-ghostable"
+version = "0.1.0"
+edition = "2021"
+description = "Ghostable lifecycle — mark tiles/agents for active/ghost/resurrected states"
+license = "MIT"
+repository = "https://github.com/plato-rs/plato-ghostable"
+keywords = ["ghost", "lifecycle", "plato", "tile", "agent"]
+categories = ["data-structures"]
+
+[dependencies]
