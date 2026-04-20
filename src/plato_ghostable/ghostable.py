@@ -1,145 +1,219 @@
-"""Ghostable — binary flag + cooldown wrapper for any tile/entity lifecycle."""
+"""Ghostable — ghost tile lifecycle with afterlife reef, resurrection, haunting, and decay tracking."""
 import time
+import math
 from dataclasses import dataclass, field
-from typing import Optional, Any
+from typing import Optional, Callable
+from collections import defaultdict
 from enum import Enum
 
-class GhostState(Enum):
+class TileState(Enum):
     ALIVE = "alive"
     FADING = "fading"
     GHOST = "ghost"
+    HAUNTING = "haunting"
     RESURRECTED = "resurrected"
+    AFTERLIFE = "afterlife"
+    EXPIRED = "expired"
+
+class ResurrectionCondition(Enum):
+    MANUAL = "manual"
+    REFERENCE = "reference"    # another tile references this one
+    IMPORTANCE = "importance"  # was once high-importance
+    SCHEDULED = "scheduled"    # scheduled resurrection at time
+    THRESHOLD = "threshold"    # room ghost count exceeds threshold
 
 @dataclass
-class GhostableConfig:
-    fade_duration: float = 3600.0  # seconds to fade before ghosting
-    auto_ghost: bool = True
-    max_resurrections: int = 10
-    cooldown_after_ghost: float = 300.0  # cooldown before re-ghosting
-
-@dataclass
-class Ghostable:
-    entity_id: str
-    entity_type: str = "tile"
-    state: GhostState = GhostState.ALIVE
-    health: float = 1.0
-    fade_started_at: float = 0.0
+class GhostTile:
+    id: str
+    content: str
+    room: str = ""
+    state: TileState = TileState.ALIVE
+    health: float = 1.0        # 1.0 = full health, 0.0 = ghost
+    ghost_threshold: float = 0.1
+    original_confidence: float = 0.5
+    importance: float = 0.5
+    created_at: float = field(default_factory=time.time)
     ghosted_at: float = 0.0
     resurrected_at: float = 0.0
     resurrection_count: int = 0
-    last_decay_tick: float = 0.0
-    config: GhostableConfig = field(default_factory=GhostableConfig)
-    payload: Any = None  # attached data
+    last_accessed: float = 0.0
+    references: int = 0         # how many tiles reference this
+    decay_rate: float = 0.01    # health loss per hour
+    haunt_boost: float = 0.0    # health boost from haunting
+    metadata: dict = field(default_factory=dict)
 
-    def is_alive(self) -> bool:
-        return self.state == GhostState.ALIVE or self.state == GhostState.RESURRECTED
+@dataclass
+class AfterlifeReef:
+    room: str
+    ghosts: list[str] = field(default_factory=list)
+    capacity: int = 1000
+    oldest_ghost: float = 0.0
 
-    def is_ghost(self) -> bool:
-        return self.state == GhostState.GHOST
+@dataclass
+class DecayEvent:
+    tile_id: str
+    room: str
+    from_state: TileState
+    to_state: TileState
+    health: float
+    timestamp: float = field(default_factory=time.time)
+    reason: str = ""
 
-    def is_fading(self) -> bool:
-        return self.state == GhostState.FADING
+class GhostableSystem:
+    def __init__(self, ghost_threshold: float = 0.1, decay_rate: float = 0.01,
+                 afterlife_capacity: int = 1000):
+        self.ghost_threshold = ghost_threshold
+        self.default_decay_rate = decay_rate
+        self._tiles: dict[str, GhostTile] = {}
+        self._afterlife: dict[str, AfterlifeReef] = {}  # room → reef
+        self._decay_log: list[ DecayEvent] = []
+        self._resurrection_rules: list[dict] = []
 
-    def start_fade(self) -> bool:
-        if self.state != GhostState.ALIVE:
+    def register(self, tile_id: str, content: str, room: str = "", confidence: float = 0.5,
+                importance: float = 0.5) -> GhostTile:
+        tile = GhostTile(id=tile_id, content=content, room=room,
+                        original_confidence=confidence, importance=importance,
+                        ghost_threshold=self.ghost_threshold,
+                        decay_rate=self.default_decay_rate)
+        self._tiles[tile_id] = tile
+        return tile
+
+    def access(self, tile_id: str) -> Optional[GhostTile]:
+        tile = self._tiles.get(tile_id)
+        if tile and tile.state in (TileState.ALIVE, TileState.FADING):
+            tile.last_accessed = time.time()
+            tile.health = min(1.0, tile.health + 0.05)  # access boosts health
+        return tile
+
+    def add_reference(self, tile_id: str):
+        tile = self._tiles.get(tile_id)
+        if tile:
+            tile.references += 1
+            tile.health = min(1.0, tile.health + 0.02)  # reference boosts health
+
+    def remove_reference(self, tile_id: str):
+        tile = self._tiles.get(tile_id)
+        if tile:
+            tile.references = max(0, tile.references - 1)
+
+    def add_resurrection_rule(self, condition: str, check_fn: Callable):
+        self._resurrection_rules.append({"condition": ResurrectionCondition(condition), "fn": check_fn})
+
+    def tick(self, room: str = "") -> list[DecayEvent]:
+        """Process one decay tick. Returns list of state transitions."""
+        events = []
+        now = time.time()
+        tiles = [t for t in self._tiles.values() if not room or t.room == room]
+        for tile in tiles:
+            if tile.state not in (TileState.ALIVE, TileState.FADING, TileState.HAUNTING):
+                continue
+            hours_since_access = (now - tile.last_accessed) / 3600 if tile.last_accessed > 0 else (now - tile.created_at) / 3600
+            decay = tile.decay_rate * hours_since_access
+            tile.health = max(0.0, tile.health - decay + tile.haunt_boost)
+            tile.haunt_boost = max(0.0, tile.haunt_boost - 0.005)  # haunt boost fades
+            # State transitions
+            old_state = tile.state
+            if tile.state == TileState.ALIVE and tile.health < 0.3:
+                tile.state = TileState.FADING
+            if tile.health <= tile.ghost_threshold and tile.state in (TileState.ALIVE, TileState.FADING):
+                self._send_to_afterlife(tile)
+                tile.state = TileState.GHOST
+                tile.ghosted_at = now
+                events.append(DecayEvent(tile.id, tile.room, old_state, TileState.GHOST,
+                                        tile.health, reason="health below threshold"))
+            if tile.state == TileState.HAUNTING and tile.health > 0.5:
+                tile.state = TileState.RESURRECTED
+                tile.resurrected_at = now
+                tile.resurrection_count += 1
+                events.append(DecayEvent(tile.id, tile.room, old_state, TileState.RESURRECTED,
+                                        tile.health, reason="haunting restored health"))
+        # Check resurrection rules
+        events.extend(self._check_resurrections(room))
+        self._decay_log.extend(events)
+        if len(self._decay_log) > 10000:
+            self._decay_log = self._decay_log[-10000:]
+        return events
+
+    def haunt(self, tile_id: str, boost: float = 0.2) -> bool:
+        tile = self._tiles.get(tile_id)
+        if not tile or tile.state != TileState.GHOST:
             return False
-        self.state = GhostState.FADING
-        self.fade_started_at = time.time()
+        tile.state = TileState.HAUNTING
+        tile.haunt_boost = boost
         return True
 
-    def decay(self, amount: float = 0.01) -> GhostState:
-        if self.state not in (GhostState.ALIVE, GhostState.FADING):
-            return self.state
-        self.health = max(0.0, self.health - amount)
-        self.last_decay_tick = time.time()
-        if self.health <= 0.0 and self.config.auto_ghost:
-            self.state = GhostState.GHOST
-            self.ghosted_at = time.time()
-        return self.state
-
-    def resurrect(self, health: float = 1.0) -> bool:
-        if self.state != GhostState.GHOST:
+    def resurrect(self, tile_id: str, health: float = 0.8) -> bool:
+        tile = self._tiles.get(tile_id)
+        if not tile or tile.state not in (TileState.GHOST, TileState.AFTERLIFE):
             return False
-        if self.resurrection_count >= self.config.max_resurrections:
-            return False
-        cooldown_end = self.ghosted_at + self.config.cooldown_after_ghost
-        if time.time() < cooldown_end:
-            return False
-        self.state = GhostState.RESURRECTED
-        self.health = min(1.0, health)
-        self.resurrected_at = time.time()
-        self.resurrection_count += 1
+        tile.state = TileState.RESURRECTED
+        tile.health = health
+        tile.resurrected_at = time.time()
+        tile.resurrection_count += 1
+        self._remove_from_afterlife(tile)
         return True
 
-    def kill(self):
-        self.health = 0.0
-        self.state = GhostState.GHOST
-        self.ghosted_at = time.time()
+    def expire(self, tile_id: str) -> bool:
+        tile = self._tiles.get(tile_id)
+        if not tile:
+            return False
+        tile.state = TileState.EXPIRED
+        tile.health = 0.0
+        return True
 
-    def boost(self, amount: float = 0.2) -> float:
-        old = self.health
-        self.health = min(1.0, self.health + amount)
-        if self.state == GhostState.FADING and self.health > 0.5:
-            self.state = GhostState.ALIVE
-            self.fade_started_at = 0.0
-        return self.health - old
+    def ghosts(self, room: str = "") -> list[GhostTile]:
+        tiles = [t for t in self._tiles.values() if t.state in (TileState.GHOST, TileState.HAUNTING)]
+        if room:
+            tiles = [t for t in tiles if t.room == room]
+        return tiles
 
-    def time_as_ghost(self) -> float:
-        if self.state != GhostState.GHOST:
-            return 0.0
-        return time.time() - self.ghosted_at
+    def afterlife(self, room: str) -> AfterlifeReef:
+        if room not in self._afterlife:
+            self._afterlife[room] = AfterlifeReef(room=room)
+        return self._afterlife[room]
 
-    def time_fading(self) -> float:
-        if self.state != GhostState.FADING:
-            return 0.0
-        return time.time() - self.fade_started_at
+    def _send_to_afterlife(self, tile: GhostTile):
+        reef = self.afterlife(tile.room)
+        if len(reef.ghosts) >= reef.capacity:
+            reef.ghosts.pop(0)  # remove oldest
+        reef.ghosts.append(tile.id)
+        reef.oldest_ghost = time.time()
+        tile.state = TileState.AFTERLIFE
 
-    def to_dict(self) -> dict:
-        return {"entity_id": self.entity_id, "entity_type": self.entity_type,
-                "state": self.state.value, "health": round(self.health, 4),
-                "resurrection_count": self.resurrection_count,
-                "fade_started_at": self.fade_started_at, "ghosted_at": self.ghosted_at,
-                "resurrected_at": self.resurrected_at}
+    def _remove_from_afterlife(self, tile: GhostTile):
+        reef = self._afterlife.get(tile.room)
+        if reef and tile.id in reef.ghosts:
+            reef.ghosts.remove(tile.id)
 
-class GhostableRegistry:
-    def __init__(self):
-        self._entities: dict[str, Ghostable] = {}
+    def _check_resurrections(self, room: str) -> list[DecayEvent]:
+        events = []
+        for rule in self._resurrection_rules:
+            try:
+                results = rule["fn"](self._tiles, room)
+                for tile_id in results:
+                    tile = self._tiles.get(tile_id)
+                    if tile and tile.state == TileState.GHOST:
+                        old = tile.state
+                        tile.state = TileState.RESURRECTED
+                        tile.health = 0.6
+                        tile.resurrected_at = time.time()
+                        tile.resurrection_count += 1
+                        events.append(DecayEvent(tile_id, tile.room, old,
+                                                TileState.RESURRECTED, tile.health,
+                                                reason=rule["condition"].value))
+            except:
+                pass
+        return events
 
-    def register(self, entity_id: str, entity_type: str = "tile",
-                 config: GhostableConfig = None, payload: Any = None) -> Ghostable:
-        g = Ghostable(entity_id=entity_id, entity_type=entity_type,
-                     config=config or GhostableConfig(), payload=payload)
-        self._entities[entity_id] = g
-        return g
-
-    def get(self, entity_id: str) -> Optional[Ghostable]:
-        return self._entities.get(entity_id)
-
-    def tick_all(self, decay: float = 0.01) -> list[str]:
-        ghosted = []
-        for eid, g in self._entities.items():
-            prev = g.state
-            g.decay(decay)
-            if prev != GhostState.GHOST and g.state == GhostState.GHOST:
-                ghosted.append(eid)
-        return ghosted
-
-    def ghosts(self) -> list[Ghostable]:
-        return [g for g in self._entities.values() if g.state == GhostState.GHOST]
-
-    def alive(self) -> list[Ghostable]:
-        return [g for g in self._entities.values() if g.is_alive()]
-
-    def fading(self) -> list[Ghostable]:
-        return [g for g in self._entities.values() if g.state == GhostState.FADING]
-
-    def resurrect(self, entity_id: str, health: float = 1.0) -> bool:
-        g = self._entities.get(entity_id)
-        return g.resurrect(health) if g else False
+    def decay_log(self, limit: int = 50) -> list[DecayEvent]:
+        return self._decay_log[-limit:]
 
     @property
     def stats(self) -> dict:
-        states = {}
-        for g in self._entities.values():
-            states[g.state.value] = states.get(g.state.value, 0) + 1
-        return {"total": len(self._entities), "states": states}
+        states = defaultdict(int)
+        for t in self._tiles.values():
+            states[t.state.value] += 1
+        return {"tiles": len(self._tiles), "states": dict(states),
+                "afterlife_rooms": len(self._afterlife),
+                "resurrection_rules": len(self._resurrection_rules),
+                "decay_events": len(self._decay_log)}
